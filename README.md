@@ -21,6 +21,7 @@ $ python Block-Train-ImageNet-pretrain.py --arch=resnet18_p --epoch=110 -b 256 -
 To train MobileNetV2,
 ```
 $python Mobilenet-extend.py --arch=mobilenet_v2 --epoch=180 -b 128 --lr=0.01 -j 1 --out-dir . -n mobilenet . --deterministic --gpus=2 --earlyexit_lossweights 0.3 --earlyexit_thresholds 0.8
+```
 
 Use ```--evaluate``` and ```--resume=model_dir``` to load a trained model and run evaluation.
 
