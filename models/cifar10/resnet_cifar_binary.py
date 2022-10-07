@@ -1,0 +1,375 @@
+#
+# Copyright (c) 2018 Intel Corporation
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+"""Resnet for CIFAR10
+
+Resnet for CIFAR10, based on "Deep Residual Learning for Image Recognition".
+This is based on TorchVision's implementation of ResNet for ImageNet, with appropriate
+changes for the 10-class Cifar-10 dataset.
+This ResNet also has layer gates, to be able to dynamically remove layers.
+
+@inproceedings{DBLP:conf/cvpr/HeZRS16,
+  author    = {Kaiming He and
+               Xiangyu Zhang and
+               Shaoqing Ren and
+               Jian Sun},
+  title     = {Deep Residual Learning for Image Recognition},
+  booktitle = {{CVPR}},
+  pages     = {770--778},
+  publisher = {{IEEE} Computer Society},
+  year      = {2016}
+}
+
+"""
+import torch.nn as nn
+import math
+import torch.utils.model_zoo as model_zoo
+
+
+__all__ = ['resnet20_cifar_binary', 'resnet32_cifar_binary', 'resnet34_cifar_binary','resnet44_cifar_binary', 'resnet56_cifar_binary']
+
+NUM_CLASSES = 10 #TODO
+
+import torch
+import torch.nn.functional as F
+class BinActive(torch.autograd.Function):
+    '''
+    Binarize the input activations and calculate the mean across channel dimension.
+    '''
+    def forward(self, input):
+        self.save_for_backward(input)
+        size = input.size()
+        mean = torch.mean(input.abs(), 1, keepdim=True)
+        input = input.sign()
+        return input, mean
+
+    def backward(self, grad_output, grad_output_mean):
+        input, = self.saved_tensors
+        grad_input = grad_output.clone()
+        grad_input[input.ge(1)] = 0
+        grad_input[input.le(-1)] = 0
+        return grad_input
+
+
+class Quantize(torch.autograd.Function):
+    #two-bit quantization
+    def forward(self, input):
+        self.save_for_backward(input)
+        size = input.size()
+        mean = torch.mean(input.abs(), 1, keepdim=True)
+        x=input
+        num_bits=8
+        v0 = 1
+        v1 = 2
+        v2 = -0.5
+        y = 2.**num_bits - 1.
+        x = x.add(v0).div(v1)
+        x = x.mul(y).round_()
+        x = x.div(y)
+        x = x.add(v2)
+        x = x.mul(v1)
+        input = x
+        return input, mean
+
+    def backward(self, grad_output, grad_output_mean):
+        input, = self.saved_tensors
+        grad_input = grad_output.clone()
+        grad_input[input.ge(1)] = 0
+        grad_input[input.le(-1)] = 0
+        return grad_input
+
+
+class BinConv2d(nn.Module):
+    def __init__(self, input_channels, output_channels,
+            kernel_size=-1, stride=-1, padding=-1, dropout=0):
+        super(BinConv2d, self).__init__()
+        self.layer_type = 'BinConv2d'
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+        self.dropout_ratio = dropout
+
+        self.bn = nn.BatchNorm2d(input_channels, eps=1e-4, momentum=0.1, affine=True)
+        if dropout!=0:
+            self.dropout = nn.Dropout(dropout)
+        self.conv = nn.Conv2d(input_channels, output_channels,
+                kernel_size=kernel_size, stride=stride, padding=padding)
+       # self.relu = nn.ReLU(inplace=True)
+    
+    def forward(self, x):
+        x = self.bn(x)
+        x, mean = BinActive()(x)
+        if self.dropout_ratio!=0:
+            x = self.dropout(x)
+        x = self.conv(x)
+        #x = self.relu(x)
+        return x
+
+class QuanConv2d(nn.Module):
+    def __init__(self, input_channels, output_channels,
+            kernel_size=-1, stride=-1, padding=-1, dropout=0):
+        super(QuanConv2d, self).__init__()
+        self.layer_type = 'BinConv2d'
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+        self.dropout_ratio = dropout
+
+        self.bn = nn.BatchNorm2d(input_channels, eps=1e-4, momentum=0.1, affine=True)
+        if dropout!=0:
+            self.dropout = nn.Dropout(dropout)
+        self.conv = nn.Conv2d(input_channels, output_channels,
+                kernel_size=kernel_size, stride=stride, padding=padding)
+       # self.relu = nn.ReLU(inplace=True)
+    
+    def forward(self, x):
+        x = self.bn(x)
+        #Quantize x
+        x, mean= Quantize()(x)
+        if self.dropout_ratio!=0:
+            x = self.dropout(x)
+        x = self.conv(x)
+        #x = self.relu(x)
+        return x
+
+
+def conv3x3(in_planes, out_planes, stride=1):
+    """3x3 convolution with padding"""
+    return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride,
+                     padding=1, bias=False)
+
+#Binary block
+class BasicBlock(nn.Module):
+    expansion = 1
+
+    def __init__(self, input_channels, output_channels, kernel_size = 3,stride=1, padding=1,downsample=None):
+        super(BasicBlock, self).__init__()
+
+        self.conv1 = BinConv2d(input_channels, output_channels, kernel_size=3,stride=stride,padding=1,dropout=0)
+        #self.bn1 = nn.BatchNorm2d(output_channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = BinConv2d(output_channels, output_channels, kernel_size=3,stride=1,padding=1,dropout=0)
+        self.bn2 = nn.BatchNorm2d(output_channels)
+        self.downsample = downsample
+        #self.do_bntan=do_bntan;
+        self.stride = stride
+
+    def forward(self, x):
+
+        residual = x
+
+        out = self.conv1(x)
+        #out = self.bn1(out)
+        out = self.relu(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+        if self.downsample is not None:
+            #if residual.data.max()>1:
+            #    import pdb; pdb.set_trace()
+            residual = self.downsample(residual)
+        out += residual
+        out = F.relu(out)
+        return out
+
+#Quantized block
+class QuanBlock(nn.Module):
+    expansion = 1
+
+    def __init__(self, input_channels, output_channels, kernel_size = 3,stride=1, padding=1,downsample=None):
+        super(QuanBlock, self).__init__()
+
+        self.conv1 = QuanConv2d(input_channels, output_channels, kernel_size=3,stride=stride,padding=1,dropout=0)
+        #self.bn1 = nn.BatchNorm2d(output_channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = QuanConv2d(output_channels, output_channels, kernel_size=3,stride=1,padding=1,dropout=0)
+        self.bn2 = nn.BatchNorm2d(output_channels)
+        self.downsample = downsample
+        #self.do_bntan=do_bntan;
+        self.stride = stride
+
+    def forward(self, x):
+
+        residual = x
+
+        out = self.conv1(x)
+        #out = self.bn1(out)
+        out = self.relu(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+        if self.downsample is not None:
+            #if residual.data.max()>1:
+            #    import pdb; pdb.set_trace()
+            residual = self.downsample(residual)
+        out += residual
+        out = F.relu(out)
+        return out
+		
+#Full Precision	block
+class BasicBlock2(nn.Module):
+    expansion = 1
+
+    def __init__(self, inplanes, planes, kernel_size=3, stride=1, padding=1, downsample1=None):
+        super(BasicBlock2, self).__init__()
+        self.do = nn.Dropout(0.3)
+        self.conv1 = nn.Conv2d(inplanes, planes, kernel_size=3,stride=stride,padding=1)
+        self.relu = nn.ReLU(inplace=True)
+        self.bn2 = nn.BatchNorm2d(planes)
+        self.conv2 =nn.Conv2d(planes, planes,kernel_size=3,stride=1,padding=1)
+        #self.tanh2 = nn.Hardtanh(inplace=True)
+        self.bn3 = nn.BatchNorm2d(planes)
+     
+        self.downsample = downsample1
+        self.stride = stride
+
+    def forward(self, x):
+
+        residual = x
+        #out = self.do(x)
+        out = self.conv1(x)
+        out = self.bn2(out)
+        out = self.relu(out)#order = C-B-A-P
+	    #out = self.do(out)
+        out = self.conv2(out)
+        out = self.bn3(out)
+
+        if self.downsample is not None:
+            residual = self.downsample(residual)
+
+        out += residual
+        out = F.relu(out)
+        return out
+
+class ResNetCifar_binary(nn.Module):
+
+    def __init__(self, block, layers, num_classes=NUM_CLASSES):
+        self.nlayers = 0
+
+        self.inflate = 1
+        self.inplanes = 16*self.inflate
+        #n = int((depth) / 6)
+        super(ResNetCifar_binary, self).__init__()
+        self.conv1 =nn.Conv2d(3, self.inplanes, kernel_size=3, stride=1, padding=1)
+        self.maxpool = lambda x: x
+        self.bn1 = nn.BatchNorm2d(self.inplanes)
+        self.relu = nn.ReLU(inplace=True)
+        print("BINARIZING LAYER 1")
+        self.layer1 = self._make_layer(block, 16*self.inflate, layers[0]-3, do_binary=False)
+        self.layer1_2 = self._make_layer2(block, 16*self.inflate, 3)
+        self.layer2 = self._make_layer(block, 32*self.inflate, layers[1]-2, stride=2,do_binary=False)
+        self.layer2_2 = self._make_layer2(BasicBlock2, 32*self.inflate, 2, stride=2)
+        #print("BINARIZING LAYER 2")
+        #self.layer2 = self._make_layer(block, 32*self.inflate, layers[1], stride=2,do_binary=False)
+        #print("BINARIZING LAYER 3")
+        #self.layer3 = self._make_layer(block, 64*self.inflate, layers[2], stride=2,do_binary=False)
+        self.layer3 = self._make_layer(BasicBlock2, 64*self.inflate, layers[2]-3, stride=2,do_binary=False)
+        self.layer3_2 = self._make_layer2(BasicBlock2, 64*self.inflate, 3, stride=2)
+        #TODO: block=Basicblock2: full precision , do_binary=false to make downsampling full-precision
+        self.layer4 = lambda x: x #self._make_layer(BasicBlock2, 128*self.inflate, layers[3], stride=2,do_binary=False)
+        self.avgpool = nn.AvgPool2d(8)
+        self.bn2 = nn.BatchNorm1d(64*self.inflate)
+        self.bn3 = nn.BatchNorm1d(num_classes)
+        self.fc = nn.Linear(64*self.inflate, num_classes)
+        
+        '''
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                n = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
+                m.weight.data.normal_(0, math.sqrt(2. / n))
+            elif isinstance(m, nn.BatchNorm2d):
+                m.weight.data.fill_(1)
+                m.bias.data.zero_()
+        '''
+    def _make_layer(self, block, planes, blocks, stride=1,do_binary=True):
+        downsample = None
+        downsample1 = None
+        if stride != 1 or self.inplanes != planes * block.expansion:
+            downsample = nn.Sequential(
+                BinConv2d(self.inplanes, planes * block.expansion,
+                          kernel_size=1, stride=stride,padding=0,dropout=0.3),
+                nn.BatchNorm2d(planes * block.expansion),
+            )
+            downsample1 = nn.Sequential(
+	        #nn.Dropout(0.3),
+                nn.Conv2d(self.inplanes, planes * block.expansion,
+                          kernel_size=1, stride=stride,padding=0),
+                nn.BatchNorm2d(planes * block.expansion),
+            )
+
+        layers = []
+        if do_binary:
+            layers.append(block(self.inplanes, planes, 1,stride, 0, downsample))
+        else:
+            layers.append(block(self.inplanes, planes, 1, stride, 0, downsample1))
+        self.inplanes = planes * block.expansion
+        for i in range(1, blocks):
+            layers.append(block(self.inplanes, planes))
+
+        return nn.Sequential(*layers)
+
+    #make_layer 2, 
+    def _make_layer2(self, block, planes, blocks, stride=1):
+        layers = []
+        for i in range(0, blocks):
+            layers.append(block(self.inplanes, planes))
+
+        return nn.Sequential(*layers)
+
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.maxpool(x) #added for XNOR net
+        x = self.bn1(x)
+        x = self.relu(x)
+
+        x = self.layer1(x)
+        x = self.layer1_2(x)
+        x = self.layer2(x)
+        x = self.layer2_2(x)
+        x = self.layer3(x)
+        x = self.layer3_2(x)
+
+        #added for XNOR net
+        x = self.layer4(x)
+        x = self.relu(x)
+
+        x = self.avgpool(x)
+        x = x.view(x.size(0), -1)
+        x = self.bn2(x) #added for XNOR net
+        x = self.fc(x)
+
+        return x
+
+
+def resnet20_cifar_binary(**kwargs):
+    model = ResNetCifar_binary(BasicBlock, [3, 3, 3], **kwargs)
+    return model
+
+def resnet32_cifar_binary(**kwargs):
+    model = ResNetCifar_binary(BasicBlock, [5, 5, 5], **kwargs)
+    return model
+def resnet34_cifar_binary(**kwargs):
+    model = ResNetCifar_binary(BasicBlock, [3, 4, 6, 3], **kwargs)
+    return model
+
+def resnet44_cifar_binary(**kwargs):
+    model = ResNetCifar_binary(BasicBlock, [7, 7, 7], **kwargs)
+    return model
+
+def resnet56_cifar_binary(**kwargs):
+    model = ResNetCifar_binary(BasicBlock, [9, 9, 9], **kwargs)
+    return model
