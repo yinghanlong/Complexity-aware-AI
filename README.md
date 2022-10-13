@@ -33,7 +33,7 @@ For more details, there are files you can refer to:
 + Setting K-bit quantization or binarization for specific layers:```/examples/classifier_compression/util_bin.py```
 + Examples of hard classes of ImageNet/CIFAR100:  ```examples/classifier_compression/mobilenet_imagenet/hard_classes.pickle```. ```examples/classifier_compression/resnet32_hardclass/hard_classes.pickle```
 
-We will add more explantions and commands later. Please email me long273@purdue.edu if you have any questions regarding the project or the codes.
+We will add more explantions and comments later. Please email me long273@purdue.edu if you have any questions regarding the project or the codes.
 
 
 ## Built With
@@ -57,10 +57,6 @@ If you used for your work, please use the following citation:
 
   year={2021},
 
-  volume={},
-
-  number={},
-
   pages={573-583},
 
   doi={10.1109/ICDCS51616.2021.00061}}
@@ -71,8 +67,6 @@ If you used for your work, please use the following citation:
   url = {https://arxiv.org/abs/2005.10851},
   
   author = {Long, Yinghan and Chakraborty, Indranil and Roy, Kaushik},
-  
-  
   
   title = {Conditionally Deep Hybrid Neural Networks Across Edge and Cloud},
   
